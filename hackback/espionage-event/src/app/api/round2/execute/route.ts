@@ -1,0 +1,174 @@
+import { NextRequest, NextResponse } from 'next/server';
+import connectToDatabase from '@/lib/mongodb';
+import CodingQuestion from '@/models/CodingQuestion';
+import Participant from '@/models/Participant';
+import { getConfig } from '@/models/EventConfig';
+import { PistonServiceError, executePistonSubmission, getPistonRuntimes } from '@/lib/piston';
+import { buildSubmissionSource, pickRound2Questions, resolvePistonRuntime, ROUND2_QUESTION_COUNT } from '@/lib/round2';
+
+const JUDGE_REQUEST_GAP_MS = 350;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Submit against hidden test cases — scoring
+export async function POST(req: NextRequest) {
+  try {
+    const { email, code, language, questionId } = await req.json();
+    if (!email || !code || !language || !questionId) {
+      return NextResponse.json({ error: 'Missing fields.' }, { status: 400 });
+    }
+
+    await connectToDatabase();
+
+    const config = await getConfig();
+    if (!config.round2Active) return NextResponse.json({ error: 'Round 2 not active.' }, { status: 403 });
+
+    const participant = await Participant.findOne({ email: email.toLowerCase() });
+    if (!participant) return NextResponse.json({ error: 'Not found.' }, { status: 404 });
+    if (!participant.isShortlisted) return NextResponse.json({ error: 'Not shortlisted.' }, { status: 403 });
+
+    const question = await CodingQuestion.findById(questionId);
+    if (!question) return NextResponse.json({ error: 'Question not found.' }, { status: 404 });
+
+    const visibleQuestions = await CodingQuestion.find({}, '_id order points difficulty').sort({ order: 1 }).lean();
+    const normalizedQuestions = visibleQuestions.map((item) => ({
+      _id: item._id.toString(),
+      order: item.order,
+      points: item.points,
+      difficulty: item.difficulty,
+    }));
+
+    let assignedIds = participant.round2QuestionIds ?? [];
+    const assignedQuestionCount = normalizedQuestions.filter((item) => assignedIds.includes(item._id)).length;
+    if (assignedIds.length !== ROUND2_QUESTION_COUNT || assignedQuestionCount !== assignedIds.length) {
+      assignedIds = pickRound2Questions(normalizedQuestions, email.toLowerCase()).map((item) => item._id);
+      participant.round2QuestionIds = assignedIds;
+      await participant.save();
+    }
+
+    if (!assignedIds.includes(questionId)) {
+      return NextResponse.json({ error: 'Question not assigned to this login.' }, { status: 403 });
+    }
+
+    const assignedQuestions = normalizedQuestions.filter((item) => assignedIds.includes(item._id));
+
+    const runtime = resolvePistonRuntime(await getPistonRuntimes(), language);
+    if (!runtime) return NextResponse.json({ error: 'Unsupported language.' }, { status: 400 });
+
+    // Run against all hidden test cases
+    const allTestCases = [
+      { input: question.sampleInput, expectedOutput: question.sampleOutput },
+      ...question.hiddenTestCases,
+    ];
+    const sourceCode = buildSubmissionSource(question.toObject(), language, code);
+
+    let passed = 0;
+    const total = allTestCases.length;
+    let verdict = 'Accepted';
+    const results: { testCase: number; status: string; passed: boolean }[] = [];
+
+    for (let i = 0; i < allTestCases.length; i++) {
+      if (i > 0) {
+        await delay(JUDGE_REQUEST_GAP_MS);
+      }
+
+      const tc = allTestCases[i];
+      try {
+        const result = await executePistonSubmission({
+          sourceCode,
+          language: runtime.pistonLanguage,
+          version: runtime.version,
+          stdin: tc.input,
+          expectedOutput: tc.expectedOutput,
+          cpuTimeLimit: question.timeLimit,
+          memoryLimit: question.memoryLimit,
+        });
+
+        const isPassed = result.status === 'Accepted';
+
+        if (isPassed) passed++;
+        else if (verdict === 'Accepted') verdict = result.status;
+
+        results.push({ testCase: i + 1, status: result.status, passed: isPassed });
+      } catch (error) {
+        const status = error instanceof PistonServiceError ? error.message : 'Runtime Error';
+        results.push({ testCase: i + 1, status, passed: false });
+        if (verdict === 'Accepted') verdict = status;
+      }
+    }
+
+    // Calculate score for this question
+    const scoreForQuestion = passed === total ? question.points : 0;
+    const testcaseScorePercent = total > 0 ? Math.round((passed / total) * 10000) / 100 : 0;
+
+    // Store submission
+    participant.round2Submissions.push({
+      questionId,
+      code,
+      language,
+      verdict: passed === total ? 'Accepted' : verdict,
+      submittedAt: new Date(),
+    });
+
+    participant.round2FinalSubmissions ??= [];
+
+    const finalSubmission = {
+      questionId,
+      questionTitle: question.title,
+      code,
+      language,
+      verdict: passed === total ? 'Accepted' : verdict,
+      passed,
+      total,
+      testcaseScorePercent,
+      submittedAt: new Date(),
+    };
+
+    const existingFinalIndex = participant.round2FinalSubmissions.findIndex(
+      (submission: { questionId: string }) => submission.questionId === questionId
+    );
+
+    if (existingFinalIndex >= 0) {
+      participant.round2FinalSubmissions[existingFinalIndex] = finalSubmission;
+    } else {
+      participant.round2FinalSubmissions.push(finalSubmission);
+    }
+
+    // Update total round2 score
+    // Recalculate from all accepted submissions
+    const acceptedQuestionIds = new Set(
+      participant.round2Submissions
+        .filter((s: { verdict: string }) => s.verdict === 'Accepted')
+        .map((s: { questionId: string }) => s.questionId)
+    );
+    // If this submission is accepted, add it
+    if (passed === total) acceptedQuestionIds.add(questionId);
+
+    // Fetch all coding questions to sum points
+    const pointsById = new Map(assignedQuestions.map((q) => [q._id, q.points]));
+    let totalScore = 0;
+    for (const acceptedId of acceptedQuestionIds) {
+      totalScore += pointsById.get(acceptedId) ?? 0;
+    }
+    participant.round2Score = totalScore;
+    await participant.save();
+
+    return NextResponse.json({
+      verdict: passed === total ? 'Accepted' : verdict,
+      passed,
+      total,
+      scoreForQuestion,
+      totalScore,
+      results,
+    });
+  } catch (err) {
+    if (err instanceof PistonServiceError) {
+      return NextResponse.json({ error: err.message }, { status: err.statusCode });
+    }
+
+    console.error('[round2/execute]', err);
+    return NextResponse.json({ error: 'Submission failed.' }, { status: 500 });
+  }
+}
